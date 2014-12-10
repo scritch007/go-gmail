@@ -22,13 +22,14 @@ import (
 
 	"code.google.com/p/goauth2/oauth"
 	gmail "code.google.com/p/google-api-go-client/gmail/v1"
+	plus "code.google.com/p/google-api-go-client/plus/v1"
 	gomail "gopkg.in/jpoehls/gophermail.v0"
 )
 
 var config = &oauth.Config{
 	ClientId:     "207816891512-prjii4141rq0rkoha06d8av8jvsfaegh.apps.googleusercontent.com", // from https://code.google.com/apis/console/
 	ClientSecret: "yuwRoqY3g9UuYWlcDbSoqDKT",                                                 // from https://code.google.com/apis/console/
-	Scope:        gmail.MailGoogleComScope,
+	Scope:        gmail.MailGoogleComScope + " " + plus.PlusMeScope + " " + plus.UserinfoEmailScope,
 	AuthURL:      "https://accounts.google.com/o/oauth2/auth",
 	TokenURL:     "https://accounts.google.com/o/oauth2/token",
 }
@@ -79,7 +80,11 @@ func main() {
 		config.Scope = *ic.Scope
 	}
 
-	client := getOAuthClient(config)
+	client, current_user, err := getOAuthClient(config)
+	if nil != err {
+		fmt.Println("Failed to get user information " + err.Error())
+		os.Exit(-1)
+	}
 	svc, err := gmail.New(client)
 	if err != nil {
 		log.Fatalf("Unable to create Gmail service: %v", err)
@@ -149,7 +154,8 @@ func main() {
 		}
 		message := gmail.Message{}
 		m := &gomail.Message{}
-		m.SetFrom("dev@legrand.ws")
+		fmt.Println(current_user.Emails)
+		m.SetFrom(current_user.DisplayName + "<" + current_user.Emails[0].Value + ">")
 		m.AddTo(flag.Arg(0))
 		m.Subject = flag.Arg(1)
 		m.Body = flag.Arg(2)
@@ -157,7 +163,7 @@ func main() {
 		if nil != err {
 			log.Fatalf("Failed to generated raw content %v", err)
 		}
-		message.Raw = base64.StdEncoding.EncodeToString(b)
+		message.Raw = base64.URLEncoding.EncodeToString(b)
 		_, err := svc.Users.Messages.Send("me", &message).Do()
 		if nil != err {
 			log.Fatalf("\n\n####################\nUnable to send message %v\n\n###########\n", err)
@@ -181,11 +187,16 @@ func tokenCacheFile(config *oauth.Config) string {
 	hash.Write([]byte(config.ClientId))
 	hash.Write([]byte(config.ClientSecret))
 	hash.Write([]byte(config.Scope))
-	fn := fmt.Sprintf("gmail-get-config%v", hash.Sum32())
+	fn := fmt.Sprintf("gmail-get-config")
 	return filepath.Join(osUserCacheDir(), url.QueryEscape(fn))
 }
 
-func tokenFromFile(file string) (*oauth.Token, error) {
+type saveTokenStruct struct {
+	Token *oauth.Token
+	User  *plus.Person
+}
+
+func tokenFromFile(file string) (*saveTokenStruct, error) {
 	if !*cacheToken {
 		return nil, errors.New("--cachetoken is false")
 	}
@@ -193,19 +204,20 @@ func tokenFromFile(file string) (*oauth.Token, error) {
 	if err != nil {
 		return nil, err
 	}
-	t := new(oauth.Token)
+	t := new(saveTokenStruct)
 	err = gob.NewDecoder(f).Decode(t)
 	return t, err
 }
 
-func saveToken(file string, token *oauth.Token) {
+func saveToken(file string, token *oauth.Token, person *plus.Person) {
 	f, err := os.Create(file)
 	if err != nil {
 		log.Printf("Warning: failed to cache oauth token: %v", err)
 		return
 	}
 	defer f.Close()
-	gob.NewEncoder(f).Encode(token)
+	s := saveTokenStruct{token, person}
+	gob.NewEncoder(f).Encode(s)
 }
 
 func condDebugTransport(rt http.RoundTripper) http.RoundTripper {
@@ -215,22 +227,42 @@ func condDebugTransport(rt http.RoundTripper) http.RoundTripper {
 	return rt
 }
 
-func getOAuthClient(config *oauth.Config) *http.Client {
+func getOAuthClient(config *oauth.Config) (*http.Client, *plus.Person, error) {
 	cacheFile := tokenCacheFile(config)
 	token, err := tokenFromFile(cacheFile)
+	fromToken := true
+	var tempToken *oauth.Token
+	var person *plus.Person
 	if err != nil {
-		token = tokenFromWeb(config)
-		saveToken(cacheFile, token)
+		tempToken = tokenFromWeb(config)
+		fromToken = false
 	} else {
 		log.Printf("Using cached token %#v from %q", token, cacheFile)
+		tempToken = token.Token
+		person = token.User
 	}
 
 	t := &oauth.Transport{
-		Token:     token,
+		Token:     tempToken,
 		Config:    config,
 		Transport: condDebugTransport(http.DefaultTransport),
 	}
-	return t.Client()
+	c := t.Client()
+	if !fromToken {
+
+		psv, err := plus.New(c)
+		if nil != err {
+			log.Printf("Failed to instantiate plus service %v", err)
+			return nil, nil, err
+		}
+		person, err = psv.People.Get("me").Do()
+		if nil != err {
+			log.Printf("Failed to get current user")
+			return nil, nil, err
+		}
+		saveToken(cacheFile, tempToken, person)
+	}
+	return c, person, nil
 }
 
 func tokenFromWeb(config *oauth.Config) *oauth.Token {
@@ -272,6 +304,7 @@ func tokenFromWeb(config *oauth.Config) *oauth.Token {
 	if err != nil {
 		log.Fatalf("Token exchange error: %v", err)
 	}
+
 	return t.Token
 }
 
